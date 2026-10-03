@@ -2438,10 +2438,6 @@ impl State {
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
-        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
-        // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.niri.pointer_inside_hot_corner = false;
-
         // We need an output to be able to move the pointer.
         if self.niri.global_space.outputs().next().is_none() {
             return;
@@ -2627,6 +2623,11 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        let hot_corner_allowed = under.hot_corner
+            && pointer
+                .with_grab(|_, grab| grab_allows_hot_corner(grab))
+                .unwrap_or(true);
+
         pointer.motion(
             self,
             under.surface.clone(),
@@ -2636,6 +2637,8 @@ impl State {
                 time: event.time(),
             },
         );
+        // A pointer grab may consume motion without updating the canonical location.
+        let motion_reached_target = pointer.current_location() == new_pos;
 
         pointer.relative_motion(
             self,
@@ -2649,17 +2652,14 @@ impl State {
 
         pointer.frame(self);
 
-        // contents_under() will return no surface when the hot corner should trigger, so
-        // pointer.motion() will set the current focus to None.
-        if under.hot_corner && pointer.current_focus().is_none() {
-            if !was_inside_hot_corner
-                && pointer
-                    .with_grab(|_, grab| grab_allows_hot_corner(grab))
-                    .unwrap_or(true)
-            {
-                self.niri.layout.toggle_overview();
-            }
-            self.niri.pointer_inside_hot_corner = true;
+        // contents_under() returns no surface for an active hot corner, so pointer.motion() will
+        // clear the current focus.
+        if hot_corner_allowed
+            && motion_reached_target
+            && pointer.current_focus().is_none()
+            && !self.niri.is_inside_hot_corner_at(pos)
+        {
+            self.niri.layout.toggle_overview();
         }
 
         // Activate a new confinement if necessary.
@@ -2689,10 +2689,6 @@ impl State {
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
-        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
-        // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.niri.pointer_inside_hot_corner = false;
-
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
@@ -2704,6 +2700,7 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.niri.seat.get_pointer().unwrap();
+        let old_pos = pointer.current_location();
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
@@ -2728,6 +2725,11 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        let hot_corner_allowed = under.hot_corner
+            && pointer
+                .with_grab(|_, grab| grab_allows_hot_corner(grab))
+                .unwrap_or(true);
+
         pointer.motion(
             self,
             under.surface,
@@ -2737,20 +2739,19 @@ impl State {
                 time: event.time(),
             },
         );
+        // A pointer grab may consume motion without updating the canonical location.
+        let motion_reached_target = pointer.current_location() == pos;
 
         pointer.frame(self);
 
-        // contents_under() will return no surface when the hot corner should trigger, so
-        // pointer.motion() will set the current focus to None.
-        if under.hot_corner && pointer.current_focus().is_none() {
-            if !was_inside_hot_corner
-                && pointer
-                    .with_grab(|_, grab| grab_allows_hot_corner(grab))
-                    .unwrap_or(true)
-            {
-                self.niri.layout.toggle_overview();
-            }
-            self.niri.pointer_inside_hot_corner = true;
+        // contents_under() returns no surface for an active hot corner, so pointer.motion() will
+        // clear the current focus.
+        if hot_corner_allowed
+            && motion_reached_target
+            && pointer.current_focus().is_none()
+            && !self.niri.is_inside_hot_corner_at(old_pos)
+        {
+            self.niri.layout.toggle_overview();
         }
 
         self.niri.maybe_activate_pointer_constraint();
@@ -5278,7 +5279,11 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     // - DnDGrab allows hot corner to DnD across workspaces.
     // - ClickGrab keeps pointer focus on the window, so the hot corner doesn't trigger.
     // - Touch grabs: touch doesn't trigger the hot corner.
-    if grab.is::<ResizeGrab>() || grab.is::<SpatialMovementGrab>() {
+    if grab.is::<PickWindowGrab>()
+        || grab.is::<PickColorGrab>()
+        || grab.is::<ResizeGrab>()
+        || grab.is::<SpatialMovementGrab>()
+    {
         return false;
     }
 
@@ -5317,7 +5322,208 @@ fn make_binds_iter<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use crate::animation::Clock;
+
+    #[test]
+    fn picker_grabs_inhibit_hot_corner() {
+        let start_data = || PointerGrabStartData::<State> {
+            focus: None,
+            button: 0,
+            location: (0., 0.).into(),
+        };
+
+        assert!(!grab_allows_hot_corner(&PickWindowGrab::new(start_data())));
+        assert!(!grab_allows_hot_corner(&PickColorGrab::new(start_data())));
+    }
+
+    #[test]
+    fn bindings_suppress_keys() {
+        let close_keysym = Keysym::q;
+        let bindings = Binds(vec![Bind {
+            key: Key {
+                trigger: Trigger::Keysym(close_keysym),
+                modifiers: Modifiers::COMPOSITOR | Modifiers::CTRL,
+            },
+            action: Action::CloseWindow,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        }]);
+
+        let comp_mod = ModKey::Super;
+        let mut suppressed_keys = HashSet::new();
+
+        let screenshot_ui = ScreenshotUi::new(Clock::default(), Default::default());
+        let disable_power_key_handling = false;
+        let is_inhibiting_shortcuts = Cell::new(false);
+
+        // The key_code we pick is arbitrary, the only thing
+        // that matters is that they are different between cases.
+
+        let close_key_code = Keycode::from(close_keysym.raw() + 8u32);
+        let close_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
+            should_intercept_key(
+                suppr,
+                &bindings.0,
+                comp_mod,
+                close_key_code,
+                close_keysym,
+                Some(close_keysym),
+                pressed,
+                mods,
+                &screenshot_ui,
+                disable_power_key_handling,
+                is_inhibiting_shortcuts.get(),
+            )
+        };
+
+        // Key event with the code which can't trigger any action.
+        let none_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
+            should_intercept_key(
+                suppr,
+                &bindings.0,
+                comp_mod,
+                Keycode::from(Keysym::l.raw() + 8),
+                Keysym::l,
+                Some(Keysym::l),
+                pressed,
+                mods,
+                &screenshot_ui,
+                disable_power_key_handling,
+                is_inhibiting_shortcuts.get(),
+            )
+        };
+
+        let mut mods = ModifiersState {
+            logo: true,
+            ctrl: true,
+            ..Default::default()
+        };
+
+        // Action press/release.
+
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(
+            filter,
+            FilterResult::Intercept(Some(Bind {
+                action: Action::CloseWindow,
+                ..
+            }))
+        ));
+        assert!(suppressed_keys.contains(&close_key_code));
+
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Intercept(None)));
+        assert!(suppressed_keys.is_empty());
+
+        // Remove mod to make it for a binding.
+
+        mods.shift = true;
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        mods.shift = false;
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        // Just none press/release.
+
+        let filter = none_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        let filter = none_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        // Press action, press arbitrary, release action, release arbitrary.
+
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(
+            filter,
+            FilterResult::Intercept(Some(Bind {
+                action: Action::CloseWindow,
+                ..
+            }))
+        ));
+
+        let filter = none_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Intercept(None)));
+
+        let filter = none_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Forward));
+
+        // Trigger and remove all mods.
+
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(
+            filter,
+            FilterResult::Intercept(Some(Bind {
+                action: Action::CloseWindow,
+                ..
+            }))
+        ));
+
+        mods = Default::default();
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Intercept(None)));
+
+        // Ensure that no keys are being suppressed.
+        assert!(suppressed_keys.is_empty());
+
+        // Now test shortcut inhibiting.
+
+        // With inhibited shortcuts, we don't intercept our shortcut.
+        is_inhibiting_shortcuts.set(true);
+
+        mods = ModifiersState {
+            logo: true,
+            ctrl: true,
+            ..Default::default()
+        };
+
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(filter, FilterResult::Forward));
+        assert!(suppressed_keys.is_empty());
+
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Forward));
+        assert!(suppressed_keys.is_empty());
+
+        // Toggle it off after pressing the shortcut.
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(filter, FilterResult::Forward));
+        assert!(suppressed_keys.is_empty());
+
+        is_inhibiting_shortcuts.set(false);
+
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Forward));
+        assert!(suppressed_keys.is_empty());
+
+        // Toggle it on after pressing the shortcut.
+        let filter = close_key_event(&mut suppressed_keys, mods, true);
+        assert!(matches!(
+            filter,
+            FilterResult::Intercept(Some(Bind {
+                action: Action::CloseWindow,
+                ..
+            }))
+        ));
+        assert!(suppressed_keys.contains(&close_key_code));
+
+        is_inhibiting_shortcuts.set(true);
+
+        let filter = close_key_event(&mut suppressed_keys, mods, false);
+        assert!(matches!(filter, FilterResult::Intercept(None)));
+        assert!(suppressed_keys.is_empty());
+    }
 
     #[test]
     fn comp_mod_handling() {
